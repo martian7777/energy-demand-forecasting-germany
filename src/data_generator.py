@@ -155,6 +155,45 @@ def _daily_shape(hour: np.ndarray) -> np.ndarray:
     return shape
 
 
+def _deterministic_demand(
+    idx: pd.DatetimeIndex, temp: np.ndarray, is_holiday: np.ndarray
+) -> np.ndarray:
+    """The noise-free demand expectation from calendar + weather drivers (MW)."""
+    hour = idx.hour.to_numpy().astype(float)
+    dow = idx.dayofweek.to_numpy()
+    day_of_year = idx.dayofyear.to_numpy()
+
+    daily = _daily_shape(hour) * config.DAILY_AMPLITUDE_MW
+    weekend = np.where(dow == 5, 0.55, np.where(dow == 6, 1.0, 0.0))
+    weekend_effect = -weekend * config.WEEKEND_REDUCTION_MW
+    seasonal = config.SEASONAL_AMPLITUDE_MW * -np.cos(
+        2 * np.pi * (day_of_year - 15) / 365.25
+    )
+    heating = np.maximum(0.0, config.TEMP_COMFORT_C - temp) * config.HEATING_COEF_MW_PER_C
+    cooling = np.maximum(0.0, temp - config.TEMP_COMFORT_C) * config.COOLING_COEF_MW_PER_C
+    holiday_effect = -is_holiday * config.HOLIDAY_REDUCTION_MW
+
+    demand = (
+        config.BASE_LOAD_MW + daily + weekend_effect + seasonal
+        + heating + cooling + holiday_effect
+    )
+    return demand
+
+
+def _price_from(
+    demand: np.ndarray, wind: np.ndarray, solar: np.ndarray, noise: np.ndarray
+) -> np.ndarray:
+    """EPEX Spot price from the merit-order relationship (EUR/MWh)."""
+    residual_load = demand * (1.0 - 0.55 * wind - 0.45 * solar)
+    price = (
+        config.PRICE_BASE_EUR
+        + config.PRICE_LOAD_COEF * (residual_load - config.BASE_LOAD_MW)
+        + config.PRICE_RENEWABLE_COEF * (0.6 * wind + 0.4 * solar)
+        + noise
+    )
+    return np.clip(price, config.PRICE_FLOOR_EUR, config.PRICE_CAP_EUR)
+
+
 def generate(
     years: float = config.SIM_YEARS,
     end: pd.Timestamp | None = None,
@@ -172,10 +211,6 @@ def generate(
     periods = int(round(years * 365.25 * 24))
     idx = pd.date_range(end=end, periods=periods, freq=config.FREQ, name="timestamp")
 
-    hour = idx.hour.to_numpy().astype(float)
-    dow = idx.dayofweek.to_numpy()
-    day_of_year = idx.dayofyear.to_numpy()
-
     # ── Weather & renewables ───────────────────────────────────────────────
     temp = _generate_temperature(idx, rng)
     wind = _generate_wind(idx, rng)
@@ -186,47 +221,13 @@ def generate(
     py_dates = idx.date  # array of datetime.date
     is_holiday = np.array([d in hol_dates for d in py_dates], dtype=int)
 
-    # ── Demand components ──────────────────────────────────────────────────
-    daily = _daily_shape(hour) * config.DAILY_AMPLITUDE_MW
-
-    # Weekend reduction, with Saturday partway between weekday and Sunday.
-    weekend = np.where(dow == 5, 0.55, np.where(dow == 6, 1.0, 0.0))
-    weekend_effect = -weekend * config.WEEKEND_REDUCTION_MW
-
-    # Seasonal: higher load in winter (heating, lighting), trough in summer.
-    seasonal = config.SEASONAL_AMPLITUDE_MW * -np.cos(
-        2 * np.pi * (day_of_year - 15) / 365.25
-    )
-
-    # Weather-driven heating/cooling (HDD/CDD style, piecewise-linear).
-    heating = np.maximum(0.0, config.TEMP_COMFORT_C - temp) * config.HEATING_COEF_MW_PER_C
-    cooling = np.maximum(0.0, temp - config.TEMP_COMFORT_C) * config.COOLING_COEF_MW_PER_C
-
-    holiday_effect = -is_holiday * config.HOLIDAY_REDUCTION_MW
-
+    # ── Demand ─────────────────────────────────────────────────────────────
     noise = rng.normal(0, config.NOISE_STD_MW, periods)
-
-    demand = (
-        config.BASE_LOAD_MW
-        + daily
-        + weekend_effect
-        + seasonal
-        + heating
-        + cooling
-        + holiday_effect
-        + noise
-    )
+    demand = _deterministic_demand(idx, temp, is_holiday) + noise
     demand = np.clip(demand, 25_000.0, None)
 
     # ── EPEX Spot price (merit-order: residual load up, renewables down) ────
-    residual_load = demand * (1.0 - 0.55 * wind - 0.45 * solar)
-    price = (
-        config.PRICE_BASE_EUR
-        + config.PRICE_LOAD_COEF * (residual_load - config.BASE_LOAD_MW)
-        + config.PRICE_RENEWABLE_COEF * (0.6 * wind + 0.4 * solar)
-        + rng.normal(0, config.PRICE_NOISE_STD, periods)
-    )
-    price = np.clip(price, config.PRICE_FLOOR_EUR, config.PRICE_CAP_EUR)
+    price = _price_from(demand, wind, solar, rng.normal(0, config.PRICE_NOISE_STD, periods))
 
     df = pd.DataFrame(
         {
@@ -240,6 +241,76 @@ def generate(
         index=idx,
     )
     return df
+
+
+def make_future_exog(
+    history: pd.DataFrame,
+    horizon: int,
+    sim: "dict | None" = None,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """
+    Build plausible *future* exogenous inputs (temp, wind, solar, price) for
+    the ``horizon`` hours following the last timestamp in ``history``.
+
+    Weather continues the seasonal/diurnal climatology with fresh stochastic
+    regimes, smoothly blended onto the last observed values for the first
+    half-day so the forecast inputs don't jump. Optional ``sim`` what-if
+    overrides let the dashboard inject synthetic weather/price events:
+
+        sim = {
+            "temp_delta_c": float,      # add to every future temperature
+            "solar_factor": float,      # scale solar (e.g. 0 = total cloud)
+            "wind_factor": float,       # scale wind capacity factor
+            "price_factor": float,      # scale the resulting EPEX price
+        }
+    """
+    sim = sim or {}
+    rng = np.random.default_rng(seed)
+    last_ts = history.index.max()
+    future_idx = pd.date_range(
+        start=last_ts + pd.Timedelta(hours=1), periods=horizon, freq=config.FREQ,
+        name="timestamp",
+    )
+
+    temp = _generate_temperature(future_idx, rng)
+    wind = _generate_wind(future_idx, rng)
+    solar = _generate_solar(future_idx, rng)
+
+    # Smoothly blend the first 12h onto the last observed weather so the
+    # forecast inputs are continuous with reality.
+    blend_n = min(12, horizon)
+    if blend_n > 0 and len(history) > 0:
+        w = np.linspace(1.0, 0.0, blend_n)
+        last = history.iloc[-1]
+        temp[:blend_n] = w * float(last["temp_c"]) + (1 - w) * temp[:blend_n]
+        wind[:blend_n] = w * float(last["wind_cf"]) + (1 - w) * wind[:blend_n]
+        solar[:blend_n] = w * float(last["solar_cf"]) + (1 - w) * solar[:blend_n]
+
+    # ── Apply what-if simulation overrides ─────────────────────────────────
+    temp = temp + float(sim.get("temp_delta_c", 0.0))
+    wind = np.clip(wind * float(sim.get("wind_factor", 1.0)), 0.0, 1.0)
+    solar = np.clip(solar * float(sim.get("solar_factor", 1.0)), 0.0, 1.0)
+
+    # Holiday mask for the future window.
+    hol_dates = holiday_lookup(future_idx.min(), future_idx.max())
+    is_holiday = np.array([d in hol_dates for d in future_idx.date], dtype=int)
+
+    # Price from the expected (noise-free) demand under these conditions.
+    exp_demand = _deterministic_demand(future_idx, temp, is_holiday)
+    price = _price_from(exp_demand, wind, solar, np.zeros(horizon))
+    price = price * float(sim.get("price_factor", 1.0))
+
+    return pd.DataFrame(
+        {
+            "temp_c": temp,
+            "wind_cf": wind,
+            "solar_cf": solar,
+            "price_eur": price,
+            "is_holiday": is_holiday,
+        },
+        index=future_idx,
+    )
 
 
 def load_or_generate(force: bool = False) -> pd.DataFrame:
