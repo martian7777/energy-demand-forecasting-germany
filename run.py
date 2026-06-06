@@ -1,11 +1,19 @@
 """
 StromCast master process runner.
 
-Launches the FastAPI backend (uvicorn) and the Streamlit dashboard
-concurrently, waits for the API to become healthy, and streams both
-processes' output until interrupted with Ctrl+C.
+Two modes:
 
-Usage::
+* **Local launcher** (``python run.py``): spawns the FastAPI backend and the
+  Streamlit dashboard as separate processes, waits for the API to become
+  healthy, and streams output until interrupted with Ctrl+C.
+
+* **Streamlit Cloud** (``streamlit run run.py``): Streamlit Cloud executes this
+  file *inside its own script thread*, so we cannot spawn a second Streamlit
+  process or install POSIX signal handlers (those only work in the main
+  thread). In that mode we instead start the FastAPI backend in a background
+  daemon thread within the same process and render the dashboard inline.
+
+Usage (local)::
 
     python run.py                 # start API + dashboard
     python run.py --train         # (re)train the model first, then start
@@ -18,9 +26,10 @@ via STROMCAST_API_PORT / STROMCAST_DASHBOARD_PORT env vars).
 from __future__ import annotations
 
 import argparse
-import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -33,6 +42,67 @@ from src import config  # noqa: E402
 PROCS: list[subprocess.Popen] = []
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Streamlit-Cloud (in-process) mode
+# ──────────────────────────────────────────────────────────────────────────
+def _running_under_streamlit() -> bool:
+    """True when this file is executed via ``streamlit run run.py``."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+def _api_listening() -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", config.API_PORT)) == 0
+
+
+def _start_api_thread() -> None:
+    """Start the FastAPI backend in a daemon thread (idempotent).
+
+    Streamlit reruns this script on every interaction, so we guard against
+    starting uvicorn more than once by checking whether the port is already
+    bound. Signal handlers are disabled because uvicorn would otherwise try to
+    install them off the main thread and crash.
+    """
+    if _api_listening():
+        return
+
+    import uvicorn
+    from src.api.main import app
+
+    cfg = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=config.API_PORT,
+        log_level="warning",
+    )
+    server = uvicorn.Server(cfg)
+    # Off-thread servers must not touch signals.
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+
+    threading.Thread(target=server.run, daemon=True, name="stromcast-api").start()
+
+    # Give uvicorn a moment to bind so the dashboard's first health check
+    # (and any quick rerun) sees the port open.
+    deadline = time.time() + 30
+    while time.time() < deadline and not _api_listening():
+        time.sleep(0.2)
+
+
+def _serve_inline() -> None:
+    """Streamlit-Cloud entry point: backend in-process, dashboard inline."""
+    _start_api_thread()
+    import runpy
+    runpy.run_path(str(ROOT / "dashboard" / "app.py"), run_name="__main__")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Local launcher (separate processes)
+# ──────────────────────────────────────────────────────────────────────────
 def _spawn(cmd: list[str], name: str) -> subprocess.Popen:
     print(f"[run] starting {name}: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, cwd=str(ROOT))
@@ -81,6 +151,8 @@ def main() -> None:
     parser.add_argument("--dashboard-only", action="store_true")
     args = parser.parse_args()
 
+    # signal handlers only work in the main thread of the main interpreter.
+    import signal
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
@@ -125,5 +197,8 @@ def main() -> None:
         _shutdown()
 
 
-if __name__ == "__main__":
+if _running_under_streamlit():
+    # Imported/executed by `streamlit run run.py` (e.g. Streamlit Cloud).
+    _serve_inline()
+elif __name__ == "__main__":
     main()
