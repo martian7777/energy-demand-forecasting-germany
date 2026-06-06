@@ -86,11 +86,18 @@ def _start_api_thread() -> None:
 
     threading.Thread(target=server.run, daemon=True, name="stromcast-api").start()
 
-    # Give uvicorn a moment to bind so the dashboard's first health check
-    # (and any quick rerun) sees the port open.
-    deadline = time.time() + 30
-    while time.time() < deadline and not _api_listening():
-        time.sleep(0.2)
+    # Block the first script run until the backend is actually healthy. The
+    # API trains the model in its startup event, so "port bound" is not enough;
+    # waiting here means the dashboard's first render already has live data
+    # instead of flashing the "cannot reach API" error.
+    url = f"{config.API_BASE_URL}{config.API_PREFIX}/health"
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        try:
+            if requests.get(url, timeout=5).status_code == 200:
+                return
+        except requests.RequestException:
+            time.sleep(1)
 
 
 def _serve_inline() -> None:
