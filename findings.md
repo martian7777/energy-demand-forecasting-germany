@@ -89,11 +89,9 @@ Using the Streamlit dashboard's what-if sliders, we simulated five distinct grid
 ### Visual: 24-Hour vs. 7-Day Forecasting
 The screenshots below display the **Forecast** tab in the Streamlit UI, showing the 24-hour and 7-day forecast horizons with compounding 95% confidence intervals.
 
-````carousel
-![24-Hour Grid Demand Forecast](docs/images/forecast_24h.png)
-<!-- slide -->
-![7-Day Grid Demand Forecast](docs/images/forecast_7d.png)
-````
+| 📈 24-Hour Grid Demand Forecast | 📅 7-Day Grid Demand Forecast |
+| :---: | :---: |
+| ![24-Hour Grid Demand Forecast](docs/images/forecast_24h.png) | ![7-Day Grid Demand Forecast](docs/images/forecast_7d.png) |
 
 ---
 

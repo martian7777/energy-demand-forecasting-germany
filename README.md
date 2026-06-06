@@ -16,15 +16,13 @@ The platform simulates three years of hourly grid data (load, temperature, renew
 
 Below is a showcase of the StromCast dashboard in action:
 
-````carousel
-![24-Hour Grid Demand Forecast](docs/images/forecast_24h.png)
-<!-- slide -->
-![7-Day Grid Demand Forecast](docs/images/forecast_7d.png)
-<!-- slide -->
-![Price vs Demand Dashboard](docs/images/price_vs_demand.png)
-<!-- slide -->
-![Model Health & Feature Importance](docs/images/model_health.png)
-````
+| 📈 24-Hour Grid Demand Forecast | 📅 7-Day Grid Demand Forecast |
+| :---: | :---: |
+| ![24-Hour Grid Demand Forecast](docs/images/forecast_24h.png) | ![7-Day Grid Demand Forecast](docs/images/forecast_7d.png) |
+
+| 💶 Price vs Demand Relationship | 🩺 Model Health & Residuals |
+| :---: | :---: |
+| ![Price vs Demand Dashboard](docs/images/price_vs_demand.png) | ![Model Health & Feature Importance](docs/images/model_health.png) |
 
 ---
 
